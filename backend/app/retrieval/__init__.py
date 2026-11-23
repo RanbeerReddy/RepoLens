@@ -1,13 +1,17 @@
-"""Retrieval module – semantic, graph-based, and hybrid search."""
+"""Retrieval package."""
 
-from app.retrieval.graph_retriever import GraphRetriever
-from app.retrieval.hybrid import HybridRetriever
-from app.retrieval.models import RetrievalResult
-from app.retrieval.semantic import SemanticRetriever
+from app.retrieval.graph_search import GraphNeighbors, GraphSearchEngine
+from app.retrieval.hybrid_search import HybridSearchEngine, HybridSearchResult
+from app.retrieval.keyword_search import KeywordResult, KeywordSearchEngine
+from app.retrieval.semantic_search import SearchResult, SemanticSearchEngine
 
 __all__ = [
-    "GraphRetriever",
-    "HybridRetriever",
-    "RetrievalResult",
-    "SemanticRetriever",
+    "SearchResult",
+    "SemanticSearchEngine",
+    "KeywordResult",
+    "KeywordSearchEngine",
+    "GraphNeighbors",
+    "GraphSearchEngine",
+    "HybridSearchResult",
+    "HybridSearchEngine",
 ]

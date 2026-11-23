@@ -1,131 +1,110 @@
-"""Chat service – retrieve context and query the LLM."""
+"""Codebase Chat Service orchestrating Hybrid Retrieval and LLM Reasoning."""
 
 from __future__ import annotations
 
-import logging
-from typing import TYPE_CHECKING
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
-if TYPE_CHECKING:
-    from app.llm.client import LLMClient
-    from app.retrieval.hybrid import HybridRetriever
-    from app.retrieval.models import RetrievalResult
-
-logger = logging.getLogger(__name__)
+from app.graph.neo4j_client import Neo4jClient
+from app.llm.prompts import build_chat_prompt
+from app.llm.vllm_client import LLMError, VLLMClient
+from app.retrieval.hybrid_search import HybridSearchEngine
 
 
-class SourceReference(BaseModel):
-    """A source citation attached to a chat answer."""
+class ChatSource(BaseModel):
+    """Verified source citation grounded in retrieved code."""
 
-    entity_id: str = ""
-    name: str = ""
-    entity_type: str = ""
-    file_path: str = ""
-    line_start: int | None = None
-    line_end: int | None = None
-    score: float | None = None
+    file_path: str
+    start_line: int
+    end_line: int
+    qualified_name: str
+    relevance_score: float
+    citation: str = Field(description="Formatted reference like 'app/auth.py:20-42'")
 
 
 class ChatResponse(BaseModel):
-    """Full response from the chat service."""
+    """Structured response from the Codebase Chat Service."""
 
+    query: str
     answer: str
-    sources: list[SourceReference] = Field(default_factory=list)
-    retrieval_results: list[dict] = Field(default_factory=list)
+    sources: list[ChatSource]
+    retrieved_count: int
+    llm_used: bool
 
 
 class ChatService:
-    """Orchestrates retrieval-augmented generation for code Q&A."""
+    """End-to-end RAG service answering codebase questions using verified evidence."""
 
     def __init__(
         self,
-        retriever: HybridRetriever,
-        llm_client: LLMClient,
+        retrieval_engine: Optional[HybridSearchEngine] = None,
+        llm_client: Optional[VLLMClient] = None,
+        neo4j_client: Optional[Neo4jClient] = None,
     ) -> None:
-        self.retriever = retriever
-        self.llm_client = llm_client
+        self.retrieval_engine = retrieval_engine or HybridSearchEngine(client=neo4j_client)
+        self.llm_client = llm_client or VLLMClient()
 
-    async def ask(
+    def ask(
         self,
-        repo_id: str,
-        question: str,
-        conversation_history: list[dict] | None = None,
+        query: str,
+        repo_id: Optional[str] = None,
+        top_k: int = 5,
     ) -> ChatResponse:
-        """Answer a question about a repository.
-
-        1. Retrieve relevant context via the hybrid retriever.
-        2. Build a prompt using the retrieved evidence.
-        3. Call the LLM.
-        4. Return the answer together with source references.
-
-        Parameters
-        ----------
-        repo_id:
-            Repository to query.
-        question:
-            User's natural-language question.
-        conversation_history:
-            Prior messages in ``[{"role": ..., "content": ...}]`` format.
-
-        Returns
-        -------
-        ChatResponse
         """
-        # 1. Retrieve context
-        from app.retrieval.models import RetrievalResult as _RR  # noqa: F811 – local alias
+        Executes hybrid retrieval, compiles verified context, and invokes LLM.
+        Gracefully returns retrieved evidence if LLM is offline or unreachable.
+        """
+        # 1. Retrieve hybrid context
+        results = self.retrieval_engine.search(query=query, limit=top_k, repo_id=repo_id)
 
-        try:
-            results: list[_RR] = await self.retriever.search(
-                repo_id=repo_id,
-                query=question,
-                limit=10,
-            )
-        except Exception:
-            logger.exception("Retrieval failed for question in repo %s", repo_id)
-            results = []
-
-        # 2. Build prompt
-        from app.llm.prompts import build_chat_prompt
-
-        messages = build_chat_prompt(
-            question=question,
-            context_results=results,
-            conversation_history=conversation_history,
-        )
-
-        # 3. Call LLM
-        from app.core.errors import LLMError
-
-        try:
-            answer = await self.llm_client.generate(messages, stream=False)
-            if not isinstance(answer, str):
-                # Shouldn't happen with stream=False, but be defensive
-                answer = "".join([chunk async for chunk in answer])
-        except LLMError:
-            raise
-        except Exception as exc:
-            raise LLMError(
-                message="Failed to generate chat response",
-                details={"error": str(exc)},
-            ) from exc
-
-        # 4. Build response
+        # 2. Extract verified sources
         sources = [
-            SourceReference(
-                entity_id=r.entity_id,
-                name=r.name,
-                entity_type=r.entity_type,
+            ChatSource(
                 file_path=r.file_path,
-                line_start=r.line_start,
-                line_end=r.line_end,
-                score=r.score,
+                start_line=r.start_line,
+                end_line=r.end_line,
+                qualified_name=r.qualified_name,
+                relevance_score=r.final_score,
+                citation=f"{r.file_path}:{r.start_line}-{r.end_line}",
             )
             for r in results
         ]
 
+        if not results:
+            return ChatResponse(
+                query=query,
+                answer="No relevant code was found in the repository for your query.",
+                sources=[],
+                retrieved_count=0,
+                llm_used=False,
+            )
+
+        # 3. Format grounded prompt
+        context_str = HybridSearchEngine.format_context_for_llm(results)
+        prompt = build_chat_prompt(query=query, code_context=context_str)
+
+        # 4. Generate grounded answer with vLLM
+        try:
+            answer = self.llm_client.generate(prompt)
+            llm_used = True
+        except LLMError as err:
+            # Graceful degradation: present retrieved evidence without failing
+            snippets = "\n".join(
+                f"- **{s.qualified_name}** in `{s.citation}` (Score: {s.relevance_score:.2f})"
+                for s in sources
+            )
+            answer = (
+                f"*(Note: LLM inference server is currently offline. Retrieved code evidence:)*\n\n"
+                f"{snippets}\n\n"
+                f"**Retrieval diagnostic**: {err}"
+            )
+            llm_used = False
+
         return ChatResponse(
+            query=query,
             answer=answer,
             sources=sources,
-            retrieval_results=[r.model_dump() for r in results],
+            retrieved_count=len(sources),
+            llm_used=llm_used,
         )

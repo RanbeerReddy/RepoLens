@@ -1,132 +1,118 @@
 export interface Repository {
   id: string;
   name: string;
-  path: string;
+  root_path: string;
   status: string;
-  created_at: string;
-  updated_at: string;
-  file_count: number;
-  function_count: number;
-  class_count: number;
-  module_count: number;
-  last_ingestion: IngestionResult | null;
+  total_files: number;
+  total_functions: number;
+  total_classes: number;
+  total_lines: number;
 }
 
-export interface IngestionResult {
-  repository_id: string;
-  status: string;
-  files_processed: number;
-  functions_found: number;
-  classes_found: number;
-  modules_found: number;
-  errors: string[];
-  duration_seconds: number;
-  started_at: string;
-  completed_at: string;
+export interface FileDetails {
+  file_path: string;
+  total_lines: number;
+  docstring: string | null;
+  source: string;
+  imports: Array<{
+    module: string | null;
+    names: string[];
+    alias_map: Record<string, string>;
+    start_line: number;
+  }>;
+  classes: Array<{
+    name: string;
+    start_line: number;
+    end_line: number;
+    bases: string[];
+    docstring: string | null;
+  }>;
+  functions: Array<{
+    name: string;
+    qualified_name: string;
+    signature: string;
+    docstring: string | null;
+    start_line: number;
+    end_line: number;
+    calls: string[];
+    is_method: boolean;
+    class_name: string | null;
+  }>;
 }
 
 export interface SearchResult {
-  entity_id: string;
-  name: string;
-  qualified_name: string;
-  entity_type: string;
-  file_path: string;
-  line_start: number;
-  line_end: number;
-  source: string;
-  score: number;
-  docstring: string | null;
-}
-
-export interface Symbol {
   id: string;
   name: string;
   qualified_name: string;
-  entity_type: string;
   file_path: string;
-  line_start: number;
-  line_end: number;
-  source: string;
-  signature: string | null;
+  start_line: number;
+  end_line: number;
+  signature: string;
   docstring: string | null;
-  decorators: string[];
+  source: string;
+  final_score: number;
+  reasons: string[];
+}
+
+export interface ChatSource {
+  file_path: string;
+  start_line: number;
+  end_line: number;
+  qualified_name: string;
+  relevance_score: number;
+  citation: string;
+}
+
+export interface ChatResponse {
+  query: string;
+  answer: string;
+  sources: ChatSource[];
+  retrieved_count: number;
+  llm_used: boolean;
+}
+
+export interface DependentEntity {
+  id: string;
+  name: string;
+  qualified_name: string;
+  file_path: string;
+  start_line: number;
+  end_line: number;
+  depth: number;
   is_method: boolean;
-  is_async: boolean;
+}
+
+export interface ImpactReport {
+  target_function: string;
+  target_qualified_name: string;
+  target_file_path: string;
+  impact_level: "LOW" | "MEDIUM" | "HIGH";
+  heuristic_rationale: string;
+  direct_callers: DependentEntity[];
+  indirect_callers: DependentEntity[];
+  callees: DependentEntity[];
+  affected_files: string[];
+  relevant_tests: string[];
+  dependency_paths: string[];
+  analysis_summary: string;
+  llm_used: boolean;
+  disclaimer: string;
 }
 
 export interface GraphNode {
   id: string;
   label: string;
-  type: string;
+  type: "file" | "class" | "function";
   file_path?: string;
-  qualified_name?: string;
 }
 
 export interface GraphEdge {
-  id: string;
   source: string;
   target: string;
-  relationship: string;
-  label?: string;
+  type: string;
 }
 
 export interface GraphData {
   nodes: GraphNode[];
   edges: GraphEdge[];
-}
-
-export interface ImpactReport {
-  target: {
-    name: string;
-    qualified_name: string;
-    entity_type: string;
-    file_path: string;
-  };
-  direct_dependents: Array<{
-    name: string;
-    qualified_name: string;
-    entity_type: string;
-    file_path: string;
-    relationship: string;
-  }>;
-  indirect_dependents: Array<{
-    name: string;
-    qualified_name: string;
-    entity_type: string;
-    file_path: string;
-    depth: number;
-  }>;
-  affected_files: string[];
-  dependency_paths: Array<{
-    path: string[];
-    relationships: string[];
-  }>;
-  summary: string;
-}
-
-export interface ChatMessage {
-  role: 'user' | 'assistant';
-  content: string;
-  sources?: Array<{
-    name: string;
-    file_path: string;
-    entity_type: string;
-    relevance: number;
-  }>;
-}
-
-export interface ChatResponse {
-  answer: string;
-  sources: Array<{
-    name: string;
-    file_path: string;
-    entity_type: string;
-    relevance: number;
-  }>;
-}
-
-export interface HealthStatus {
-  status: string;
-  neo4j: string;
-  version: string;
 }

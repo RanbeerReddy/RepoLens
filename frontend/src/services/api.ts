@@ -1,121 +1,112 @@
-import axios from 'axios';
-import type {
-  Repository,
-  IngestionResult,
-  SearchResult,
-  Symbol,
+import {
+  ChatResponse,
+  FileDetails,
   GraphData,
   ImpactReport,
-  ChatMessage,
-  ChatResponse,
-  HealthStatus,
-} from '@/types';
+  Repository,
+  SearchResult,
+} from "../types";
 
-const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
-  headers: {
-    'Content-Type': 'application/json',
-  },
-});
+const API_BASE = "http://localhost:8080/api";
 
-// Health
-export async function getHealth(): Promise<HealthStatus> {
-  const { data } = await api.get('/health');
-  return data;
+export async function fetchHealth(): Promise<{ neo4j: boolean; llm: boolean }> {
+  try {
+    const [neo, llm] = await Promise.all([
+      fetch("http://localhost:8080/health/neo4j").then((r) => r.json()),
+      fetch("http://localhost:8080/health/llm").then((r) => r.json()),
+    ]);
+    return { neo4j: neo.connected, llm: llm.connected };
+  } catch {
+    return { neo4j: false, llm: false };
+  }
 }
 
-// Repositories
 export async function listRepositories(): Promise<Repository[]> {
-  const { data } = await api.get('/repositories');
-  return data;
+  const res = await fetch(`${API_BASE}/repositories`);
+  if (!res.ok) throw new Error("Failed to load repositories");
+  return res.json();
 }
 
-export async function createRepository(path: string, name: string): Promise<Repository> {
-  const { data } = await api.post('/repositories', { path, name });
-  return data;
+export async function registerRepository(path: string, name?: string): Promise<Repository> {
+  const res = await fetch(`${API_BASE}/repositories`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, name }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "Registration failed" }));
+    throw new Error(err.detail || "Registration failed");
+  }
+  return res.json();
 }
 
-export async function getRepository(id: string): Promise<Repository> {
-  const { data } = await api.get(`/repositories/${id}`);
-  return data;
+export async function ingestRepository(repoId: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/repositories/${encodeURIComponent(repoId)}/ingest`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error("Ingestion failed");
+  return res.json();
 }
 
-export async function deleteRepository(id: string): Promise<void> {
-  await api.delete(`/repositories/${id}`);
+export async function listFiles(repoId: string): Promise<string[]> {
+  const res = await fetch(`${API_BASE}/repositories/${encodeURIComponent(repoId)}/files`);
+  if (!res.ok) return [];
+  return res.json();
 }
 
-// Ingestion
-export async function ingestRepository(id: string): Promise<IngestionResult> {
-  const { data } = await api.post(`/repositories/${id}/ingest`);
-  return data;
+export async function getFileDetails(repoId: string, filePath: string): Promise<FileDetails> {
+  const res = await fetch(
+    `${API_BASE}/repositories/${encodeURIComponent(repoId)}/files/${encodeURIComponent(filePath)}`
+  );
+  if (!res.ok) throw new Error("Failed to load file details");
+  return res.json();
 }
 
-// Search
 export async function searchCode(
-  id: string,
+  repoId: string,
   query: string,
-  limit: number = 20
+  limit = 8
 ): Promise<SearchResult[]> {
-  const { data } = await api.get(`/repositories/${id}/search`, {
-    params: { query, limit },
+  const res = await fetch(`${API_BASE}/repositories/${encodeURIComponent(repoId)}/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, limit }),
   });
-  return data;
+  if (!res.ok) return [];
+  return res.json();
 }
 
-// Symbols
-export async function getSymbols(
-  id: string,
-  params?: { entity_type?: string; file_path?: string; limit?: number; offset?: number }
-): Promise<Symbol[]> {
-  const { data } = await api.get(`/repositories/${id}/symbols`, { params });
-  return data;
-}
-
-export async function getSymbol(id: string, symbolId: string): Promise<Symbol> {
-  const { data } = await api.get(`/repositories/${id}/symbols/${symbolId}`);
-  return data;
-}
-
-// Graph
-export async function getGraph(id: string, limit: number = 100): Promise<GraphData> {
-  const { data } = await api.get(`/repositories/${id}/graph`, {
-    params: { limit },
-  });
-  return data;
-}
-
-export async function getNeighbors(
-  id: string,
-  entityId: string,
-  depth: number = 1
-): Promise<GraphData> {
-  const { data } = await api.get(`/repositories/${id}/graph/neighbors/${entityId}`, {
-    params: { depth },
-  });
-  return data;
-}
-
-// Impact Analysis
-export async function analyzeImpact(
-  id: string,
-  symbol: string,
-  depth: number = 3
-): Promise<ImpactReport> {
-  const { data } = await api.get(`/repositories/${id}/impact`, {
-    params: { symbol, depth },
-  });
-  return data;
-}
-
-// Chat
-export async function chat(
-  id: string,
-  question: string,
-  history: ChatMessage[] = []
+export async function askChat(
+  repoId: string,
+  query: string,
+  top_k = 5
 ): Promise<ChatResponse> {
-  const { data } = await api.post(`/repositories/${id}/chat`, {
-    question,
-    history,
+  const res = await fetch(`${API_BASE}/repositories/${encodeURIComponent(repoId)}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, top_k }),
   });
-  return data;
+  if (!res.ok) throw new Error("Chat request failed");
+  return res.json();
+}
+
+export async function analyzeImpact(
+  repoId: string,
+  functionName: string
+): Promise<ImpactReport> {
+  const res = await fetch(`${API_BASE}/repositories/${encodeURIComponent(repoId)}/impact`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ function_name: functionName }),
+  });
+  if (!res.ok) throw new Error("Impact analysis failed");
+  return res.json();
+}
+
+export async function getGraphData(repoId: string, focus?: string): Promise<GraphData> {
+  const url = new URL(`${API_BASE}/repositories/${encodeURIComponent(repoId)}/graph`);
+  if (focus) url.searchParams.set("focus", focus);
+  const res = await fetch(url.toString());
+  if (!res.ok) return { nodes: [], edges: [] };
+  return res.json();
 }

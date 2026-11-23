@@ -1,8 +1,5 @@
-"""API layer — routers and dependency injection."""
+"""API package."""
 
-from app.api.dependencies import get_db, get_settings
+from app.api.repositories import router as repositories_router
 
-__all__ = [
-    "get_db",
-    "get_settings",
-]
+__all__ = ["repositories_router"]

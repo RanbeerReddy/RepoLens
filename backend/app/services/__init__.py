@@ -1,17 +1,19 @@
-"""Services module – business-logic layer."""
+"""Services package."""
 
-from app.services.chat_service import ChatResponse, ChatService, SourceReference
-from app.services.impact_service import ImpactReport, ImpactService
-from app.services.ingestion_service import IngestionResult, IngestionService
-from app.services.repository_service import RepositoryService
+from app.services.chat_service import ChatResponse, ChatService, ChatSource
+from app.services.impact_service import (
+    DependentEntity,
+    ImpactLevel,
+    ImpactReport,
+    ImpactService,
+)
 
 __all__ = [
-    "ChatResponse",
     "ChatService",
-    "ImpactReport",
+    "ChatResponse",
+    "ChatSource",
     "ImpactService",
-    "IngestionResult",
-    "IngestionService",
-    "RepositoryService",
-    "SourceReference",
+    "ImpactReport",
+    "ImpactLevel",
+    "DependentEntity",
 ]

@@ -1,402 +1,374 @@
-"""Core Python AST parser – extracts functions, classes, imports, and call sites."""
+"""Python AST Parser for RepoLens.
+
+Parses Python source files into structured code entities:
+- Module docstrings
+- Imports and alias maps
+- Classes and inheritance bases
+- Functions, signatures, docstrings, line numbers, and call sites
+"""
 
 from __future__ import annotations
 
 import ast
-import hashlib
-import logging
-from pathlib import Path
+from pathlib import PurePosixPath
+from typing import Optional
 
-from .models import (
-    ParsedClass,
-    ParsedFunction,
-    ParsedFunctionCall,
-    ParsedImport,
-    ParsedModule,
+from app.parser.call_extractor import CallExtractor
+from app.parser.models import (
+    ClassEntity,
+    FunctionEntity,
+    ImportEntity,
+    ParsedFile,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class PythonASTParser:
-    """Parse a single Python file into structured :class:`ParsedModule` data."""
+    """Deterministic AST parser for Python source files."""
 
-    def __init__(self, repo_id: str, repo_root: str) -> None:
-        self.repo_id = repo_id
-        self.repo_root = Path(repo_root).resolve()
+    def __init__(self, repo_name: str = "") -> None:
+        self.repo_name = repo_name
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def parse_file(self, file_path: str) -> ParsedModule:
-        """Read *file_path*, parse its AST, and return a :class:`ParsedModule`.
-
-        Syntax errors and encoding errors are handled gracefully: the returned
-        ``ParsedModule`` will have its ``error`` field populated instead of
-        raising an exception.
+    def parse_file(
+        self,
+        file_path: str,
+        source_code: str,
+        file_hash: str = "",
+    ) -> ParsedFile:
         """
-        abs_path = Path(file_path).resolve()
-        try:
-            rel_path = str(abs_path.relative_to(self.repo_root))
-        except ValueError:
-            rel_path = str(abs_path)
+        Parses a single Python file into a ParsedFile entity.
 
-        # Attempt to read the file ------------------------------------------------
-        try:
-            source = abs_path.read_text(encoding="utf-8", errors="replace")
-        except (OSError, UnicodeDecodeError) as exc:
-            return self._error_module(rel_path, 0, f"Could not read file: {exc}")
+        Args:
+            file_path: Normalized relative POSIX path, e.g. 'app/core/auth.py'
+            source_code: Full string content of the Python file
+            file_hash: SHA-256 hash of the file content
 
-        source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
-        size_bytes = abs_path.stat().st_size
+        Returns:
+            ParsedFile containing all extracted code entities
+        """
+        normalized_path = self._normalize_path(file_path)
+        file_id = f"file:{normalized_path}"
+        lines = source_code.splitlines(keepends=True)
+        total_lines = len(lines)
+        size_bytes = len(source_code.encode("utf-8", errors="replace"))
 
-        # Attempt to parse --------------------------------------------------------
         try:
-            tree = ast.parse(source, filename=rel_path)
-        except SyntaxError as exc:
-            return self._error_module(
-                rel_path,
-                size_bytes,
-                f"SyntaxError: {exc.msg} (line {exc.lineno})",
-                source_hash=source_hash,
+            tree = ast.parse(source_code, filename=normalized_path)
+        except SyntaxError as err:
+            return ParsedFile(
+                id=file_id,
+                file_path=normalized_path,
+                file_hash=file_hash,
+                size_bytes=size_bytes,
+                total_lines=total_lines,
+                syntax_valid=False,
+                error_message=f"SyntaxError at line {err.lineno}: {err.msg}",
+            )
+        except Exception as err:
+            return ParsedFile(
+                id=file_id,
+                file_path=normalized_path,
+                file_hash=file_hash,
+                size_bytes=size_bytes,
+                total_lines=total_lines,
+                syntax_valid=False,
+                error_message=f"Parse failure: {type(err).__name__}: {str(err)}",
             )
 
         module_docstring = ast.get_docstring(tree)
-        imports = self._extract_imports(tree)
-        functions = self._extract_functions(tree, source, rel_path, parent_class=None)
-        classes = self._extract_classes(tree, source, rel_path)
+        module_qual_path = self._module_path_from_file(normalized_path)
 
-        entity_id = self._make_entity_id(rel_path, "module", rel_path)
+        imports: list[ImportEntity] = []
+        classes: list[ClassEntity] = []
+        functions: list[FunctionEntity] = []
 
-        return ParsedModule(
-            file_path=rel_path,
-            entity_id=entity_id,
-            repo_id=self.repo_id,
-            source_hash=source_hash,
-            size_bytes=size_bytes,
-            imports=imports,
-            functions=functions,
-            classes=classes,
-            module_docstring=module_docstring,
-            error=None,
-        )
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                import_ent = self._parse_import(node)
+                if import_ent:
+                    imports.append(import_ent)
 
-    # ------------------------------------------------------------------
-    # Import extraction
-    # ------------------------------------------------------------------
-
-    def _extract_imports(self, tree: ast.Module) -> list[ParsedImport]:
-        imports: list[ParsedImport] = []
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    imports.append(
-                        ParsedImport(
-                            module=alias.name,
-                            names=[alias.name],
-                            alias=alias.asname,
-                            is_from=False,
-                            line_number=node.lineno,
-                        )
-                    )
-            elif isinstance(node, ast.ImportFrom):
-                module_name = node.module or ""
-                names = [a.name for a in node.names]
-                imports.append(
-                    ParsedImport(
-                        module=module_name,
-                        names=names,
-                        alias=None,
-                        is_from=True,
-                        line_number=node.lineno,
-                    )
+            elif isinstance(node, ast.ClassDef):
+                cls_ent = self._parse_class(
+                    node=node,
+                    file_path=normalized_path,
+                    module_qual_path=module_qual_path,
+                    lines=lines,
                 )
-        return imports
+                classes.append(cls_ent)
 
-    # ------------------------------------------------------------------
-    # Function extraction
-    # ------------------------------------------------------------------
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func_ent = self._parse_function(
+                    node=node,
+                    file_path=normalized_path,
+                    module_qual_path=module_qual_path,
+                    lines=lines,
+                    is_method=False,
+                    class_name=None,
+                )
+                functions.append(func_ent)
 
-    def _extract_functions(
-        self,
-        node: ast.AST,
-        source: str,
-        file_path: str,
-        parent_class: str | None = None,
-    ) -> list[ParsedFunction]:
-        functions: list[ParsedFunction] = []
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                func = self._build_parsed_function(child, source, file_path, parent_class)
-                functions.append(func)
-        return functions
-
-    def _build_parsed_function(
-        self,
-        func_node: ast.FunctionDef | ast.AsyncFunctionDef,
-        source: str,
-        file_path: str,
-        parent_class: str | None,
-    ) -> ParsedFunction:
-        name = func_node.name
-        qualified_name = f"{parent_class}.{name}" if parent_class else name
-        is_async = isinstance(func_node, ast.AsyncFunctionDef)
-        is_method = parent_class is not None
-
-        line_start = func_node.lineno
-        line_end = func_node.end_lineno or func_node.lineno
-        func_source = self._get_source_segment(source, func_node)
-        signature = self._build_signature(func_node)
-        docstring = ast.get_docstring(func_node)
-        decorators = self._extract_decorators(func_node)
-        calls = self._extract_function_calls(func_node, context=qualified_name)
-        args = self._extract_args(func_node)
-
-        entity_id = self._make_entity_id(file_path, "function", qualified_name)
-
-        return ParsedFunction(
-            name=name,
-            qualified_name=qualified_name,
-            entity_id=entity_id,
-            file_path=file_path,
-            line_start=line_start,
-            line_end=line_end,
-            source=func_source,
-            signature=signature,
-            docstring=docstring,
-            decorators=decorators,
-            is_method=is_method,
-            is_async=is_async,
-            calls=calls,
-            args=args,
+        return ParsedFile(
+            id=file_id,
+            file_path=normalized_path,
+            file_hash=file_hash,
+            size_bytes=size_bytes,
+            total_lines=total_lines,
+            docstring=module_docstring,
+            imports=imports,
+            classes=classes,
+            functions=functions,
+            syntax_valid=True,
+            error_message=None,
         )
 
-    # ------------------------------------------------------------------
-    # Class extraction
-    # ------------------------------------------------------------------
+    def _parse_import(self, node: ast.Import | ast.ImportFrom) -> Optional[ImportEntity]:
+        """Extracts import details and alias mappings."""
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+            alias_map = {alias.asname: alias.name for alias in node.names if alias.asname}
+            return ImportEntity(
+                module=None,
+                names=names,
+                alias_map=alias_map,
+                is_relative=False,
+                level=0,
+                start_line=node.lineno,
+            )
 
-    def _extract_classes(
+        if isinstance(node, ast.ImportFrom):
+            names = [alias.name for alias in node.names]
+            alias_map = {alias.asname: alias.name for alias in node.names if alias.asname}
+            is_relative = (node.level or 0) > 0
+            return ImportEntity(
+                module=node.module,
+                names=names,
+                alias_map=alias_map,
+                is_relative=is_relative,
+                level=node.level or 0,
+                start_line=node.lineno,
+            )
+
+        return None
+
+    def _parse_class(
         self,
-        node: ast.AST,
-        source: str,
+        node: ast.ClassDef,
         file_path: str,
-    ) -> list[ParsedClass]:
-        classes: list[ParsedClass] = []
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, ast.ClassDef):
-                cls = self._build_parsed_class(child, source, file_path)
-                classes.append(cls)
-        return classes
+        module_qual_path: str,
+        lines: list[str],
+    ) -> ClassEntity:
+        """Extracts a class definition, inheritance bases, and methods."""
+        class_name = node.name
+        qualified_name = f"{module_qual_path}.{class_name}" if module_qual_path else class_name
+        class_id = f"class:{file_path}:{class_name}"
 
-    def _build_parsed_class(
-        self,
-        class_node: ast.ClassDef,
-        source: str,
-        file_path: str,
-    ) -> ParsedClass:
-        name = class_node.name
-        qualified_name = name
-        line_start = class_node.lineno
-        line_end = class_node.end_lineno or class_node.lineno
-        class_source = self._get_source_segment(source, class_node)
-        docstring = ast.get_docstring(class_node)
-        decorators = self._extract_decorators(class_node)
-        bases = self._extract_bases(class_node)
-        methods = self._extract_functions(class_node, source, file_path, parent_class=name)
+        docstring = ast.get_docstring(node)
+        bases = [self._unparse_safe(b) for b in node.bases]
+        decorators = [self._unparse_safe(d) for d in node.decorator_list]
 
-        entity_id = self._make_entity_id(file_path, "class", qualified_name)
+        start_line = node.lineno
+        end_line = getattr(node, "end_lineno", start_line)
 
-        return ParsedClass(
-            name=name,
+        methods: list[FunctionEntity] = []
+        for child in node.body:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                method_ent = self._parse_function(
+                    node=child,
+                    file_path=file_path,
+                    module_qual_path=module_qual_path,
+                    lines=lines,
+                    is_method=True,
+                    class_name=class_name,
+                )
+                methods.append(method_ent)
+
+        return ClassEntity(
+            id=class_id,
+            name=class_name,
             qualified_name=qualified_name,
-            entity_id=entity_id,
             file_path=file_path,
-            line_start=line_start,
-            line_end=line_end,
-            source=class_source,
             docstring=docstring,
-            decorators=decorators,
+            start_line=start_line,
+            end_line=end_line,
             bases=bases,
             methods=methods,
+            decorators=decorators,
         )
 
-    # ------------------------------------------------------------------
-    # Function-call extraction
-    # ------------------------------------------------------------------
-
-    def _extract_function_calls(
+    def _parse_function(
         self,
-        node: ast.AST,
-        context: str | None = None,
-    ) -> list[ParsedFunctionCall]:
-        calls: list[ParsedFunctionCall] = []
-        for child in ast.walk(node):
-            if not isinstance(child, ast.Call):
-                continue
-            name, qualified = self._resolve_call_name(child.func)
-            if name is None:
-                continue
-            calls.append(
-                ParsedFunctionCall(
-                    name=name,
-                    qualified_name=qualified,
-                    line_number=getattr(child, "lineno", 0),
-                    context=context,
-                )
-            )
-        return calls
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        file_path: str,
+        module_qual_path: str,
+        lines: list[str],
+        is_method: bool = False,
+        class_name: Optional[str] = None,
+    ) -> FunctionEntity:
+        """Extracts a function or method definition, signature, and call sites."""
+        func_name = node.name
+        is_async = isinstance(node, ast.AsyncFunctionDef)
 
-    @staticmethod
-    def _resolve_call_name(func_node: ast.expr) -> tuple[str | None, str | None]:
-        """Return ``(simple_name, qualified_name | None)`` for a call target.
+        if is_method and class_name:
+            scope_prefix = f"{class_name}."
+            scope_id = f"{class_name}:{func_name}"
+        else:
+            scope_prefix = ""
+            scope_id = f"global:{func_name}"
 
-        Handles:
-        - ``func()``           → ("func", None)
-        - ``obj.method()``     → ("method", "obj.method")
-        - ``a.b.c()``          → ("c", "a.b.c")
-        """
-        if isinstance(func_node, ast.Name):
-            return func_node.id, None
-        if isinstance(func_node, ast.Attribute):
-            parts: list[str] = [func_node.attr]
-            value = func_node.value
-            while isinstance(value, ast.Attribute):
-                parts.append(value.attr)
-                value = value.value
-            if isinstance(value, ast.Name):
-                parts.append(value.id)
-            parts.reverse()
-            qualified = ".".join(parts)
-            return func_node.attr, qualified
-        return None, None
+        qualified_name = (
+            f"{module_qual_path}.{scope_prefix}{func_name}"
+            if module_qual_path
+            else f"{scope_prefix}{func_name}"
+        )
+        func_id = f"func:{file_path}:{scope_id}"
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+        start_line = node.lineno
+        end_line = getattr(node, "end_lineno", start_line)
 
-    @staticmethod
-    def _get_source_segment(source: str, node: ast.AST) -> str:
-        """Extract the source text for *node*, falling back to line slicing."""
-        try:
-            segment = ast.get_source_segment(source, node)
-            if segment is not None:
-                return segment
-        except (TypeError, AttributeError):
-            pass
+        # Extract source slice safely
+        source_snippet = self._extract_source_slice(lines, start_line, end_line)
 
-        # Fallback: slice by line range
-        lines = source.splitlines()
-        start = getattr(node, "lineno", 1) - 1
-        end = getattr(node, "end_lineno", start + 1)
-        return "\n".join(lines[start:end])
+        # Extract signature, parameters, and return type
+        signature, parameters, return_type = self._extract_signature(node)
 
-    @staticmethod
-    def _build_signature(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
-        """Build a human-readable signature string such as ``(self, x: int, y='hello')``."""
-        args = func_node.args
-        parts: list[str] = []
+        # Extract docstring
+        docstring = ast.get_docstring(node)
 
-        # Positional-only / regular positional args --------------------------------
-        all_positional = args.posonlyargs + args.args
-        defaults_offset = len(all_positional) - len(args.defaults)
+        # Extract decorators
+        decorators = [self._unparse_safe(d) for d in node.decorator_list]
 
-        for idx, arg in enumerate(all_positional):
-            part = arg.arg
-            if arg.annotation:
-                part += f": {ast.unparse(arg.annotation)}"
-            default_idx = idx - defaults_offset
-            if default_idx >= 0:
-                part += f"={ast.unparse(args.defaults[default_idx])}"
-            parts.append(part)
-            # Mark end of positional-only section
-            if arg in args.posonlyargs and arg is args.posonlyargs[-1]:
-                parts.append("/")
+        # Extract calls
+        distinct_calls, call_sites = CallExtractor.extract_from_node(node, caller_name=func_name)
 
-        # *args -------------------------------------------------------------------
+        return FunctionEntity(
+            id=func_id,
+            name=func_name,
+            qualified_name=qualified_name,
+            file_path=file_path,
+            signature=signature,
+            docstring=docstring,
+            source=source_snippet,
+            start_line=start_line,
+            end_line=end_line,
+            calls=distinct_calls,
+            call_sites=call_sites,
+            decorators=decorators,
+            parameters=parameters,
+            return_type=return_type,
+            is_async=is_async,
+            is_method=is_method,
+            class_name=class_name,
+        )
+
+    def _extract_signature(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[str, list[str], Optional[str]]:
+        """Constructs a clean normalized function signature string."""
+        func_name = node.name
+        prefix = "async def " if isinstance(node, ast.AsyncFunctionDef) else "def "
+
+        param_names: list[str] = []
+        param_strs: list[str] = []
+
+        args = node.args
+
+        # Positional-only args (Python 3.8+)
+        for arg in getattr(args, "posonlyargs", []):
+            param_names.append(arg.arg)
+            param_strs.append(self._format_arg(arg))
+        if getattr(args, "posonlyargs", []):
+            param_strs.append("/")
+
+        # Standard args
+        defaults_offset = len(args.args) - len(args.defaults)
+        for i, arg in enumerate(args.args):
+            param_names.append(arg.arg)
+            default_val = None
+            if i >= defaults_offset:
+                default_idx = i - defaults_offset
+                default_val = self._unparse_safe(args.defaults[default_idx])
+            param_strs.append(self._format_arg(arg, default_val))
+
+        # Vararg (*args)
         if args.vararg:
-            va = f"*{args.vararg.arg}"
-            if args.vararg.annotation:
-                va += f": {ast.unparse(args.vararg.annotation)}"
-            parts.append(va)
+            param_names.append(f"*{args.vararg.arg}")
+            param_strs.append(f"*{self._format_arg(args.vararg)}")
         elif args.kwonlyargs:
-            parts.append("*")
+            param_strs.append("*")
 
-        # Keyword-only args -------------------------------------------------------
-        for idx, arg in enumerate(args.kwonlyargs):
-            part = arg.arg
-            if arg.annotation:
-                part += f": {ast.unparse(arg.annotation)}"
-            default = args.kw_defaults[idx]
-            if default is not None:
-                part += f"={ast.unparse(default)}"
-            parts.append(part)
+        # Keyword-only args
+        for i, arg in enumerate(args.kwonlyargs):
+            param_names.append(arg.arg)
+            default_val = None
+            if i < len(args.kw_defaults) and args.kw_defaults[i] is not None:
+                default_val = self._unparse_safe(args.kw_defaults[i])
+            param_strs.append(self._format_arg(arg, default_val))
 
-        # **kwargs ----------------------------------------------------------------
+        # Kwarg (**kwargs)
         if args.kwarg:
-            kw = f"**{args.kwarg.arg}"
-            if args.kwarg.annotation:
-                kw += f": {ast.unparse(args.kwarg.annotation)}"
-            parts.append(kw)
+            param_names.append(f"**{args.kwarg.arg}")
+            param_strs.append(f"**{self._format_arg(args.kwarg)}")
 
-        sig = f"({', '.join(parts)})"
+        return_annotation: Optional[str] = None
+        if node.returns:
+            return_annotation = self._unparse_safe(node.returns)
 
-        # Return annotation -------------------------------------------------------
-        if func_node.returns:
-            sig += f" -> {ast.unparse(func_node.returns)}"
+        params_joined = ", ".join(param_strs)
+        if return_annotation:
+            full_sig = f"{prefix}{func_name}({params_joined}) -> {return_annotation}"
+        else:
+            full_sig = f"{prefix}{func_name}({params_joined})"
 
-        return sig
+        return full_sig, param_names, return_annotation
+
+    def _format_arg(self, arg: ast.arg, default: Optional[str] = None) -> str:
+        """Formats an ast.arg with optional type annotation and default value."""
+        base = arg.arg
+        if arg.annotation:
+            ann = self._unparse_safe(arg.annotation)
+            base = f"{base}: {ann}"
+        if default is not None:
+            base = f"{base}={default}"
+        return base
 
     @staticmethod
-    def _extract_decorators(
-        node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
-    ) -> list[str]:
-        return [ast.unparse(d) for d in node.decorator_list]
+    def _extract_source_slice(lines: list[str], start_line: int, end_line: int) -> str:
+        """Extracts exact lines 1-based [start_line..end_line] from the file."""
+        if not lines:
+            return ""
+        # 1-based line indexing
+        start_idx = max(0, start_line - 1)
+        end_idx = min(len(lines), end_line)
+        return "".join(lines[start_idx:end_idx]).strip("\r\n")
 
     @staticmethod
-    def _extract_bases(class_node: ast.ClassDef) -> list[str]:
-        return [ast.unparse(b) for b in class_node.bases]
+    def _normalize_path(path_str: str) -> str:
+        """Converts backslashes to forward slashes and removes leading dot slashes."""
+        posix = PurePosixPath(path_str.replace("\\", "/"))
+        return str(posix)
 
     @staticmethod
-    def _extract_args(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
-        """Return a flat list of argument names (positional, keyword, *args, **kwargs)."""
-        names: list[str] = []
-        for a in func_node.args.posonlyargs:
-            names.append(a.arg)
-        for a in func_node.args.args:
-            names.append(a.arg)
-        if func_node.args.vararg:
-            names.append(f"*{func_node.args.vararg.arg}")
-        for a in func_node.args.kwonlyargs:
-            names.append(a.arg)
-        if func_node.args.kwarg:
-            names.append(f"**{func_node.args.kwarg.arg}")
-        return names
+    def _module_path_from_file(file_path: str) -> str:
+        """
+        Converts file path to python module dot notation.
+        e.g. 'app/core/auth.py' -> 'app.core.auth'
+             'app/__init__.py' -> 'app'
+        """
+        clean = file_path.replace("\\", "/")
+        if clean.endswith(".py"):
+            clean = clean[:-3]
+        parts = clean.split("/")
+        if parts and parts[-1] == "__init__":
+            parts = parts[:-1]
+        return ".".join(p for p in parts if p and p != ".")
 
-    def _make_entity_id(self, file_path: str, entity_type: str, qualified_name: str) -> str:
-        return f"{self.repo_id}:{file_path}:{entity_type}:{qualified_name}"
-
-    # ------------------------------------------------------------------
-    # Error helpers
-    # ------------------------------------------------------------------
-
-    def _error_module(
-        self,
-        rel_path: str,
-        size_bytes: int,
-        error_msg: str,
-        source_hash: str = "",
-    ) -> ParsedModule:
-        logger.warning("Parse error for %s: %s", rel_path, error_msg)
-        return ParsedModule(
-            file_path=rel_path,
-            entity_id=self._make_entity_id(rel_path, "module", rel_path),
-            repo_id=self.repo_id,
-            source_hash=source_hash,
-            size_bytes=size_bytes,
-            imports=[],
-            functions=[],
-            classes=[],
-            module_docstring=None,
-            error=error_msg,
-        )
+    @staticmethod
+    def _unparse_safe(node: Optional[ast.AST]) -> str:
+        """Safely unparses an AST node or returns empty string."""
+        if node is None:
+            return ""
+        try:
+            return ast.unparse(node)
+        except Exception:
+            return "<expr>"

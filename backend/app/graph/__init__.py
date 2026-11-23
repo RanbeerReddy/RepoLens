@@ -1,6 +1,8 @@
-"""Graph construction and query operations for the Neo4j code graph."""
+"""Neo4j graph package."""
 
-from app.graph.builder import GraphBuilder
-from app.graph.operations import GraphOperations
+from app.graph.ingester import GraphIngester
+from app.graph.neo4j_client import Neo4jClient
+from app.graph.queries import GraphQueries
+from app.graph.schema import init_schema
 
-__all__ = ["GraphBuilder", "GraphOperations"]
+__all__ = ["Neo4jClient", "init_schema", "GraphQueries", "GraphIngester"]

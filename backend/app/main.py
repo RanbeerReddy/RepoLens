@@ -1,68 +1,59 @@
-"""FastAPI application entry point for RepoLens."""
+"""RepoLens FastAPI application entrypoint."""
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
-from app.core.config import get_settings
-from app.core.logging import get_logger, setup_logging
-from app.db.neo4j_client import get_neo4j_client
-from app.db.schema import init_schema
+from app.api.repositories import router as repositories_router
+from app.graph.neo4j_client import Neo4jClient
+from app.llm.vllm_client import VLLMClient
 
-logger = get_logger(__name__)
+app = FastAPI(
+    title="RepoLens API",
+    description="AI-powered codebase intelligence platform",
+    version="1.0.0",
+)
 
+# Enable CORS for frontend development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Manage startup and shutdown tasks."""
-    settings = get_settings()
-
-    # ── Startup ──────────────────────────────────────────────────────────
-    setup_logging(level=settings.LOG_LEVEL)
-    logger.info("Starting RepoLens API v%s", app.version)
-
-    client = get_neo4j_client()
-    await client.connect()
-    await init_schema(client)
-
-    logger.info("Startup complete")
-    yield
-
-    # ── Shutdown ─────────────────────────────────────────────────────────
-    logger.info("Shutting down RepoLens API")
-    await client.close()
+app.include_router(repositories_router)
 
 
-def create_app() -> FastAPI:
-    """Build and return the configured :class:`FastAPI` application."""
-    settings = get_settings()
-
-    app = FastAPI(
-        title="RepoLens API",
-        version="0.1.0",
-        lifespan=lifespan,
-    )
-
-    # ── CORS ─────────────────────────────────────────────────────────────
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.CORS_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # ── Routers ──────────────────────────────────────────────────────────
-    from app.api.routes import all_routers  # noqa: E402
-
-    for r in all_routers:
-        app.include_router(r)
-
-    return app
+@app.get("/health")
+def health_check() -> dict[str, str]:
+    """Basic service health check."""
+    return {"status": "ok", "service": "RepoLens API"}
 
 
-app = create_app()
+@app.get("/health/neo4j")
+def neo4j_health() -> dict[str, Any]:
+    """Checks Neo4j database connectivity."""
+    client = Neo4jClient()
+    alive = client.ping()
+    return {"status": "ok" if alive else "offline", "connected": alive}
+
+
+@app.get("/health/llm")
+def llm_health() -> dict[str, Any]:
+    """Checks vLLM or OpenAI-compatible endpoint status."""
+    client = VLLMClient()
+    alive = client.ping()
+    return {"status": "ok" if alive else "offline", "connected": alive}
+
+
+# Serve built frontend if dist directory exists
+frontend_dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+if frontend_dist.is_dir():
+    app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="frontend")
